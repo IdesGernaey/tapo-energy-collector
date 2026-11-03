@@ -140,6 +140,16 @@ def cmd_discover(args: argparse.Namespace) -> int:
     for d in found:
         energy = "yes" if d.energy else ("no" if d.energy is False else "?")
         print(f"{d.host:<16} {d.model:<10} {energy:<7} {d.mac:<18} {d.error or d.alias}")
+    if any("TPAP" in d.error for d in found):
+        print(
+            "\nPlugs marked 'TPAP' run newer firmware (P110 1.4.x) whose login python-kasa does not support yet\n"
+            "(https://github.com/python-kasa/python-kasa/issues/1590). They cannot be read until python-kasa adds it;\n"
+            "turn off automatic firmware updates in the Tapo app for plugs that still work."
+        )
+    usable = [d for d in found if d.energy and not d.error]
+    if not usable:
+        print("\nNo readable energy-monitoring plugs were found, so there is no configuration to suggest.")
+        return EXIT_WARNING
     print("\nSuggested configuration (check the ids and names, then copy into config.yaml):\n")
     print(yaml_snippet(found))
     return EXIT_OK

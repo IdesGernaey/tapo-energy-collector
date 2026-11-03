@@ -131,8 +131,19 @@ class TapoPlug:
                 await asyncio.wait_for(device.update(), self.timeout)
                 return device
         except Exception as error:
-            if classify_error(error) == "auth":
+            kind = classify_error(error)
+            if kind == "auth":
                 raise
+            if kind == "unsupported":
+                # The plug answered, but announced a protocol this python-kasa version cannot speak
+                # (e.g. encrypt_type 'TPAP' on P110 firmware 1.4.x). Trying other protocols will not help.
+                hint = (
+                    " This firmware uses TP-Link's newer TPAP login, which python-kasa does not support yet "
+                    "(see https://github.com/python-kasa/python-kasa/issues/1590). Update python-kasa once a release supports it."
+                    if "TPAP" in str(error)
+                    else ""
+                )
+                raise DeviceReadError(f"{self.settings.host} answered but is not supported by python-kasa: {error}.{hint}", "unsupported") from error
             log.info("Device %s: UDP discovery failed (%s); trying direct TCP connection", self.settings.id, error)
         device = await asyncio.wait_for(
             Discover.try_connect_all(self.settings.host, credentials=self.credentials, timeout=int(self.timeout)),

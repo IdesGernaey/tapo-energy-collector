@@ -269,3 +269,14 @@ async def test_polls_are_skipped_while_the_system_clock_is_unset(storage: Storag
     poller = DevicePoller(plug, storage, "c", clock=lambda: 86400.0)  # 1970: Raspberry Pi before NTP sync
     assert await poller.poll_once() is False
     assert storage.stats().pending == 0 and plug.results == [42.0]  # plug not even read
+
+
+async def test_tpap_firmware_is_reported_as_unsupported_not_unreachable(fake_kasa: Kasa, storage: Storage) -> None:
+    fake_kasa.discover_result = kasa.UnsupportedDeviceError(
+        "Unsupported device 192.0.2.10 of type SMART.TAPOPLUG with encrypt_scheme EncryptionScheme(encrypt_type='TPAP', lv=2)"
+    )
+    with pytest.raises(DeviceReadError) as info:
+        await TapoPlug(SETTINGS, CREDS, storage).read()
+    assert info.value.kind == "unsupported"
+    assert "TPAP" in str(info.value) and "issues/1590" in str(info.value)
+    assert fake_kasa.calls == ["discover_single"]  # no pointless protocol probing
