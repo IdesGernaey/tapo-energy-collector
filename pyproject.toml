@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tapo-energy-collector"
+description = "UGent Racing: read Tapo P110 smart plugs and upload energy readings to the CCBOM website"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary - UGent Racing" }
+authors = [{ name = "UGent Racing" }]
+dynamic = ["version"]
+# Compatible-release ranges; the exact tested versions are pinned in requirements.lock.
+dependencies = [
+    "python-kasa>=0.12.0,<0.13",
+    "httpx>=0.28,<0.29",
+    "PyYAML>=6.0.2,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "pytest-asyncio>=1.4,<2",
+    "respx>=0.23,<0.24",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<3",
+    "types-PyYAML>=6,<7",
+]
+
+[project.scripts]
+tapo-collector = "tapo_collector.main:main"
+
+[tool.hatch.version]
+path = "src/tapo_collector/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tapo_collector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = ["S101", "S311", "ASYNC109", "RUF001", "RUF002", "RUF003", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = false
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true

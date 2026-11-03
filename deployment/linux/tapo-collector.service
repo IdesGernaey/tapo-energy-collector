@@ -1,0 +1,54 @@
+[Unit]
+Description=UGent Racing Tapo P110 energy collector
+Documentation=https://github.com/UgentRacing/tapo-energy-collector
+# Start once the network is up and the clock is synchronised (a Raspberry Pi has no battery-backed clock).
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+# Keep retrying forever: never give up after repeated crashes.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tapo-collector
+Group=tapo-collector
+# Secrets: root-only file, read by systemd before dropping privileges.
+EnvironmentFile=/etc/tapo-collector/collector.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tapo-collector/venv/bin/tapo-collector --config /etc/tapo-collector/config.yaml run
+Restart=always
+RestartSec=15
+# SIGTERM -> graceful shutdown (finishes the current upload, max ~25 s).
+KillSignal=SIGTERM
+TimeoutStopSec=40
+
+# Persistent, service-owned directories: /var/lib/tapo-collector (SQLite buffer) and /var/log/tapo-collector (rotating logs).
+StateDirectory=tapo-collector
+StateDirectoryMode=0750
+LogsDirectory=tapo-collector
+LogsDirectoryMode=0750
+UMask=0027
+
+# Hardening: the collector only needs outbound network access and its own two directories.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

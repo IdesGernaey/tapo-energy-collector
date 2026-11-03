@@ -1,0 +1,61 @@
+# Tapo energy collector configuration (no secrets in this file - those go in the .env file).
+# Linux service: /etc/tapo-collector/config.yaml   Local test: ./config.yaml
+# Relative paths are relative to the directory of this file.
+
+# Name of this collector, shown on the website next to each reading. Letters, digits, . _ -
+collector_id: workshop-pc
+
+# How often every plug is read (seconds). Can be overridden per device.
+# 10 s gives detailed graphs; each plug then produces ~8 640 readings (~1 MB) per day on the website.
+polling_interval_seconds: 10
+
+# How long to wait for a plug to answer before counting the poll as failed.
+device_timeout_seconds: 10
+
+# The plugs. Addresses below are PLACEHOLDERS - replace them with your plugs' reserved addresses.
+# id:       stable internal ID - lowercase letters, digits, _ or -. Register the SAME id on the
+#           website's Energy page; never reuse an id for a different machine.
+# name:     human-readable name.
+# host:     IP address (preferably a DHCP reservation) or hostname.
+# machine:  optional workshop machine this plug powers.
+# category: optional group, e.g. "3D printer".
+devices:
+  - id: printer_01
+    name: "3D Printer 1"
+    host: "192.168.1.50"
+    machine: ""
+    category: "3D printer"
+
+  - id: soldering_01
+    name: "Soldering Station"
+    host: "192.168.1.51"
+    category: "Electronics"
+    # polling_interval_seconds: 30   # optional per-device override
+
+upload:
+  # The website's ingestion endpoint. Must be https:// (http only for localhost tests).
+  # Can also be set with ENERGY_API_URL in the .env file.
+  endpoint_url: "https://YOUR-WEBSITE/api/energy/measurements"
+  batch_size: 200                 # readings per request (max 500)
+  timeout_seconds: 20
+  min_retry_seconds: 5            # first retry delay after a failed upload
+  max_retry_seconds: 600          # retry delay cap (exponential backoff with jitter)
+  auth_failure_retry_seconds: 300 # pause after 401/403 (wrong or revoked token)
+  unknown_device_retry_seconds: 600  # retry delay for readings of plugs not registered on the website
+
+storage:
+  database_path: "data/collector.sqlite"
+  delivered_retention_days: 7     # keep delivered readings locally this long (for troubleshooting)
+  rejected_retention_days: 30
+  max_pending_measurements: 2000000  # safety cap for undelivered readings (~300 MB); oldest dropped beyond it
+
+logging:
+  directory: "logs"
+  level: INFO                     # DEBUG, INFO, WARNING or ERROR
+  max_bytes: 5000000              # rotate collector.log at 5 MB
+  backup_count: 5                 # keep 5 old log files
+
+alerts:
+  device_offline_after_seconds: 300   # log an ALERT when a plug has not answered for 5 minutes
+  upload_failing_after_seconds: 900   # log an ALERT when uploads have failed for 15 minutes
+  repeat_every_seconds: 3600          # repeat ongoing alerts hourly
