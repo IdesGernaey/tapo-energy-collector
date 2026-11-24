@@ -5,4 +5,4 @@ local SQLite queue and uploads the readings to the CCBOM website over HTTPS.
 The collector only *reads* the plugs: it never switches them on or off.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

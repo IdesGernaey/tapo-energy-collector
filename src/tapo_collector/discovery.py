@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from tapo_collector.config import DeviceSettings
+from tapo_collector.config import DeviceSettings, normalize_mac
 from tapo_collector.devices import DeviceReadError, Reading, TapoPlug
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ async def discover_network(target: str, credentials: Any, timeout: int = 5) -> l
         try:
             await asyncio.wait_for(device.update(), 10)
             item.alias = device.alias or ""
-            item.mac = device.mac or ""
+            item.mac = normalize_mac(device.mac) or (device.mac or "")
             item.energy = Module.Energy in device.modules
         except Exception as error:
             item.error = f"{type(error).__name__}: {error}"
@@ -71,7 +71,8 @@ def yaml_snippet(devices: list[FoundDevice]) -> str:
         lines += [
             f"  - id: {device.suggested_id(index)}",
             f'    name: "{name}"',
-            f'    host: "{device.host}"   # reserve this address in the router (DHCP reservation)',
+            f'    host: "{device.host}"   # initial address; the collector follows the plug if it changes',
+            *([f'    mac: "{device.mac}"   # permanent identity of this physical plug'] if device.mac else []),
             '    machine: ""',
             '    category: ""',
         ]
@@ -79,17 +80,34 @@ def yaml_snippet(devices: list[FoundDevice]) -> str:
 
 
 class _MemoryCache:
+    """In-memory stand-in for :class:`tapo_collector.storage.Storage` (one-off tests must not touch the service database)."""
+
     def __init__(self) -> None:
-        self.data: dict[tuple[str, str], dict[str, Any]] = {}
+        self.data: dict[str, tuple[str, dict[str, Any]]] = {}
+        self.identities: dict[str, tuple[str, str]] = {}
 
     def get_connection(self, device_id: str, host: str) -> dict[str, Any] | None:
-        return self.data.get((device_id, host))
+        item = self.data.get(device_id)
+        return item[1] if item else None
 
     def set_connection(self, device_id: str, host: str, config: dict[str, Any]) -> None:
-        self.data[(device_id, host)] = config
+        self.data[device_id] = (host, config)
 
     def forget_connection(self, device_id: str) -> None:
-        self.data = {k: v for k, v in self.data.items() if k[0] != device_id}
+        self.data.pop(device_id, None)
+
+    def get_last_host(self, device_id: str) -> str | None:
+        item = self.data.get(device_id)
+        return item[0] if item else None
+
+    def get_identity(self, device_id: str) -> tuple[str, str] | None:
+        return self.identities.get(device_id)
+
+    def set_identity(self, device_id: str, mac: str, source: str) -> None:
+        self.identities[device_id] = (mac, source)
+
+    def identity_owner(self, mac: str) -> str | None:
+        return next((d for d, (m, _) in self.identities.items() if m == mac), None)
 
 
 async def test_device(

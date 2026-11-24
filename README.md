@@ -87,8 +87,8 @@ to log in to the plugs, because newer firmware requires it.
   UDP discovery is optional.
 * The **Tapo app account** (email and password) that the plugs were set up with.
 * An **ingestion token** from a website administrator ([section 8](#8-configure-the-website-endpoint)).
-* Ask the network administrator for a **fixed IP address (DHCP reservation) for each plug**. Then the address in the
-  configuration never changes.
+* Optional: a **fixed IP address (DHCP reservation) for each plug**. It is no longer required: when a plug gets a new
+  address, the collector finds it again by its MAC address ([section 12](#plug-changed-ip-address-automatic-rediscovery)).
 
 ## 4. Install Python and the collector
 
@@ -145,8 +145,8 @@ It lists every plug with its IP address, model and name, and prints a ready-to-p
 **Option B: manually.** In the Tapo app open the plug, then ⚙ → *Device info*, and note the **IP address** and the
 **MAC address**. You can also find them in the router's list of DHCP clients.
 
-Then **reserve that IP address for the plug's MAC address** in the router (DHCP reservation), or ask the network
-administrator to do it. Without a reservation the address can change and the plug will appear offline.
+Put the **MAC address** in the configuration too (next section). A DHCP reservation is still nice to have, but no
+longer needed: if the address changes, the collector looks for the plug's MAC address and continues automatically.
 
 Test one plug. This only reads it:
 
@@ -164,7 +164,8 @@ A plug has to be added in **two places**, with the **same ID**:
    devices:
      - id: printer_01              # lowercase letters, digits, _ or -; never reuse an ID for another machine
        name: "3D Printer 1"
-       host: "192.168.1.50"        # its reserved IP address (or hostname)
+       host: "192.168.1.50"        # its current IP address (or hostname); followed automatically if it changes
+       mac: "A8:42:A1:00:00:01"    # recommended: Tapo app > Device info. Learned automatically if omitted
        machine: "Prusa MK4"        # optional
        category: "3D printer"      # optional
        # polling_interval_seconds: 30   # optional, default from the top of the file
@@ -288,7 +289,9 @@ Status meanings on the website:
 | `FAILED (unreachable)` | Wrong IP (check in the Tapo app), plug unplugged, or the computer is on a different network or VLAN (guest Wi-Fi often isolates devices). Try `ping <ip>`. |
 | `discover` finds nothing | Broadcasts are blocked (normal on managed networks). Use the IP from the Tapo app ([section 6](#6-discover-the-plugs)). |
 | `FAILED (unsupported) … has no energy monitoring` | That is not a P110 (e.g. a P100). Only energy-monitoring plugs work. |
-| Plug was fine, now always offline | Its IP changed: make a DHCP reservation and update `host:`. After a firmware update the cached connection is renewed automatically. |
+| Plug was fine, now always offline | Usually an IP change, which is handled automatically (see below). `sudo tapo-collector status` shows the rediscovery state. If it says `identity unknown`, add `mac:`. If it says `broadcast blocked`/`no_response`, configure an alternative (below). After a firmware update the cached connection is renewed automatically. |
+| Log: `… is plug 'x' (MAC …), not y` | Another plug (or someone else's) now has this plug's old address. It is **not** read under the wrong ID; rediscovery looks for the right plug. Nothing to do unless it persists. |
+| Log: `ignoring unknown Tapo device` | A Tapo device that is not in `devices:` answered discovery. It is never used. |
 | `test-upload`: `HTTP 401` | The token is wrong or revoked. Create a new one ([section 13](#13-rotate-passwords-and-tokens)). |
 | `HTTP 404` / `endpoint_url` error | Wrong URL, or the website version without energy monitoring is still deployed. |
 | `network error` / `timed out` | No internet, DNS problem, or a proxy/firewall blocks outbound HTTPS. Readings are kept; check `curl -I https://<website>/api/health`. |
@@ -299,6 +302,33 @@ Status meanings on the website:
 | Service does not start | `journalctl -u tapo-collector -n 50`, then `sudo tapo-collector check-config` shows configuration errors in plain language. |
 
 For more detail, set `logging.level: DEBUG` in the configuration and restart.
+
+### Plug changed IP address (automatic rediscovery)
+
+Every plug is identified by its **MAC address** (`mac:` in the configuration, or learned on its first successful
+connection and stored in the database). When a plug stops answering:
+
+1. It is marked offline (an offline marker without values is stored; nothing is invented) and its **last known
+   address** is retried with the normal polling backoff (up to every 5 minutes). Other plugs are not affected.
+2. After `rediscovery.failures_before_rediscovery` failed attempts (default 3), or immediately when a *different*
+   plug answers at that address, the collector **searches the network** for the plug's MAC address.
+3. A candidate address is only accepted after logging in and checking that the plug reports the expected MAC.
+   The new address is stored in the database (it survives restarts) and polling continues at once.
+4. If the search fails, it is repeated after 30 s, 60 s, 120 s … up to 15 minutes (`min/max_interval_seconds`).
+
+Log lines to look for: `connection lost`, `rediscovery started`, `identity verified`, `IP address changed from … to …`,
+`reconnected`, `rediscovery failed`.
+
+**When broadcast discovery is blocked** (common on UGentSurfing and other managed networks), `sudo tapo-collector
+status` shows `broadcast blocked` (a connected plug did not answer the broadcast) or `broadcast no_response`. Then a
+plug that changed address cannot be found by broadcast. Ask the network administrator which of these is allowed, set
+it under `rediscovery:` in `config.yaml`, then run `sudo systemctl restart tapo-collector`:
+
+| Option | What it does | When to use |
+|---|---|---|
+| `scan_networks: ["10.10.4.0/24"]` | Sends the Tapo discovery request (UDP 20002/9999, no login) to every address of that range, once per search. Max /22. | Unicast UDP between the PC and the plugs is allowed. |
+| `candidate_hosts: ["10.10.4.20", "10.10.4.21"]` | Tries each address or hostname directly over TCP with a login and checks the MAC. | All UDP is blocked, but the plugs' possible addresses (a small pool) or DHCP hostnames are known. |
+| DHCP reservation | The address never changes. | Always the most robust option, if the network allows it. |
 
 ## 13. Rotate passwords and tokens
 
@@ -347,6 +377,36 @@ cd ~/tapo-energy-collector
 sudo sh deployment/linux/update.sh     # git pull + reinstall + graceful restart; queued readings are kept
 ```
 
+### Deploying version 1.1 (automatic reconnection) on the workshop PC
+
+Version 1.1 adds automatic recovery after IP changes. It keeps the database, the measurement IDs, the ingestion token
+and the systemd unit; existing plug IDs (e.g. `hotplate_01`, `soldering_01`) are unchanged. Only a new table is added
+to the SQLite database, so going back to 1.0 still works.
+
+1. **Before**, note the current state: `sudo tapo-collector status` (all plugs should be online).
+2. **Update** (keeps queued readings; the service stops gracefully and restarts):
+
+   ```sh
+   cd ~/tapo-energy-collector
+   sudo sh deployment/linux/update.sh
+   ```
+
+3. **Pin the identities** (recommended). After the update each plug's MAC is learned on its first connection:
+
+   ```sh
+   journalctl -u tapo-collector --since "10 min ago" | grep "identity learned"
+   ```
+
+   Compare each MAC with the Tapo app (Device info) and add it to that plug in `/etc/tapo-collector/config.yaml`
+   as `mac: "AA:BB:CC:DD:EE:FF"`. Then run `sudo tapo-collector check-config && sudo systemctl restart tapo-collector`.
+4. **Check broadcast**: after the first search, `sudo tapo-collector status` shows `Rediscovery … broadcast …`
+   (`not_tried` until a plug has needed one; the acceptance test below triggers one). If it reports `blocked` or
+   `no_response`, configure `scan_networks` or `candidate_hosts` ([section 12](#plug-changed-ip-address-automatic-rediscovery)).
+5. **Accept**: run [docs/MANUAL_TEST.md](docs/MANUAL_TEST.md) section 3b (plug comes back with a different address).
+
+Rollback: check out the previous commit in `~/tapo-energy-collector` and run `sudo sh deployment/linux/install.sh`.
+Version 1.0 ignores the new `mac:` and `rediscovery:` settings and the new database table, so nothing else is needed.
+
 **Updating dependencies** (developers): change the ranges in `pyproject.toml`, then regenerate the lock file in a clean
 environment (`python -m venv /tmp/lock && /tmp/lock/bin/pip install . && /tmp/lock/bin/pip freeze --exclude tapo-energy-collector`).
 Keep the `; platform_system == "Windows"` markers on `colorama` and `tzdata`. Run `pytest`, open a pull request (CI runs
@@ -365,6 +425,7 @@ src/tapo_collector/
   uploader.py        HTTP client + status-code handling, exponential backoff with jitter, batch splitting
   service.py         one polling task per plug, upload loop, alerts, status.json, graceful shutdown
   discovery.py       broadcast discovery and single-plug test
+  rediscovery.py     finds a plug again after an IP change: broadcast / unicast scan / candidate hosts (MAC hints)
   logging_config.py  console + rotating file logs, secret redaction
 deployment/linux     systemd unit, installer, update, uninstall, CLI wrapper
 deployment/windows   Task Scheduler installer (alternative)
@@ -372,6 +433,10 @@ docs/API.md          ingestion API contract (website side lives in UgentRacing/c
 ```
 
 Key decisions:
+
+* **A plug's identity is its MAC address**, never its IP address. Each connection and each read checks the MAC
+  reported over the authenticated connection; discovery replies (unauthenticated) are only used as hints. The last
+  verified address and the identity are stored in SQLite (`device_connections`, `device_identities`).
 
 * **Readings are saved before upload.** IDs are deterministic (UUIDv5 of collector + device + timestamp), so a retry
   after a lost response is acknowledged as a duplicate and never stored twice.

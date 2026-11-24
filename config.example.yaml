@@ -16,13 +16,18 @@ device_timeout_seconds: 10
 # id:       stable internal ID - lowercase letters, digits, _ or -. Register the SAME id on the
 #           website's Energy page; never reuse an id for a different machine.
 # name:     human-readable name.
-# host:     IP address (preferably a DHCP reservation) or hostname.
+# host:     initial IP address or hostname. If the plug later gets another DHCP address, the collector
+#           finds it again automatically (see 'rediscovery' below) - no need to edit this.
+# mac:      optional but recommended: the plug's MAC address (Tapo app > Device info), its permanent identity.
+#           If omitted, it is learned on the first successful connection and stored in the database.
+#           A plug is only ever read under its ID after its MAC has been verified.
 # machine:  optional workshop machine this plug powers.
 # category: optional group, e.g. "3D printer".
 devices:
   - id: printer_01
     name: "3D Printer 1"
     host: "192.168.1.50"
+    # mac: "A8:42:A1:00:00:01"
     machine: ""
     category: "3D printer"
 
@@ -54,6 +59,21 @@ logging:
   level: INFO                     # DEBUG, INFO, WARNING or ERROR
   max_bytes: 5000000              # rotate collector.log at 5 MB
   backup_count: 5                 # keep 5 old log files
+
+# Finding a plug again after its IP address changed (unplugged, moved, new DHCP lease).
+# The plug's last address is retried first; after repeated failures (or at once when a different plug answers
+# there) the network is searched, and a candidate is only accepted after logging in and verifying its MAC.
+rediscovery:
+  enabled: true
+  failures_before_rediscovery: 3      # failed attempts at the last known address before searching
+  min_interval_seconds: 30            # wait after a failed search; doubles each time ...
+  max_interval_seconds: 900           # ... up to this maximum
+  discovery_timeout_seconds: 5
+  broadcast_targets: ["255.255.255.255"]   # or your subnet's broadcast address, e.g. "192.168.1.255"
+  # Managed networks (e.g. UGentSurfing) often block broadcast. 'sudo tapo-collector status' then reports
+  # "broadcast blocked" or "no_response". Use one of these network-approved alternatives (ask the network admin):
+  scan_networks: []                   # e.g. ["10.10.4.0/24"]: unicast discovery probe of every address (max /22)
+  candidate_hosts: []                 # e.g. ["10.10.4.20", "tapo-hotplate.local"]: tried directly with a login
 
 alerts:
   device_offline_after_seconds: 300   # log an ALERT when a plug has not answered for 5 minutes

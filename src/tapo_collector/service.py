@@ -21,6 +21,7 @@ from tapo_collector import __version__
 from tapo_collector.config import DeviceSettings, Secrets, Settings
 from tapo_collector.devices import DeviceReadError, Reading, TapoPlug, kasa_credentials
 from tapo_collector.measurements import format_timestamp, offline_measurement, online_measurement
+from tapo_collector.rediscovery import Rediscovery
 from tapo_collector.storage import Storage
 from tapo_collector.uploader import ApiClient, Outcome, UploadManager
 
@@ -52,9 +53,10 @@ class DeviceState:
     last_error_kind: str = ""
     last_power_w: float | None = None
     last_alert: float | None = None
+    connection: dict[str, Any] | None = None  # TapoPlug.connection_status(): address, identity, rediscovery
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "device_id": self.device_id,
             "name": self.name,
             "host": self.host,
@@ -66,6 +68,9 @@ class DeviceState:
             "last_error": self.last_error,
             "last_power_w": self.last_power_w,
         }
+        if self.connection is not None:
+            data["connection"] = self.connection
+        return data
 
 
 def _iso(value: float | None) -> str | None:
@@ -84,9 +89,25 @@ class DevicePoller:
         self.collector_id = collector_id
         self.clock = clock
         s = plug.settings
-        self.state = DeviceState(device_id=s.id, name=s.name, host=s.host)
+        self.state = DeviceState(device_id=s.id, name=s.name, host=getattr(plug, "host", s.host))
+        self._refresh_connection()
+
+    def _refresh_connection(self) -> None:
+        self.state.host = getattr(self.plug, "host", self.plug.settings.host)
+        status = getattr(self.plug, "connection_status", None)
+        if callable(status):
+            try:
+                self.state.connection = status()
+            except Exception as error:
+                log.debug("Device %s: connection status unavailable: %s", self.state.device_id, error)
 
     async def poll_once(self) -> bool:
+        try:
+            return await self._poll_once()
+        finally:
+            self._refresh_connection()
+
+    async def _poll_once(self) -> bool:
         """Read the plug once and store the result (online or offline). Returns True on success."""
         settings = self.plug.settings
         self.state.last_attempt = self.clock()
@@ -103,7 +124,14 @@ class DevicePoller:
         measurement = online_measurement(self.collector_id, settings.id, reading.timestamp, reading.metrics)
         self.storage.save(measurement)
         if self.state.consecutive_failures:
-            log.info("Device %s (%s) is reachable again after %d failed poll(s)", settings.id, settings.name, self.state.consecutive_failures)
+            log.info(
+                "Device %s (%s) reconnected at %s after %d failed poll(s); offline for %.0f s",
+                settings.id,
+                settings.name,
+                getattr(self.plug, "host", settings.host),
+                self.state.consecutive_failures,
+                self.clock() - (self.state.offline_since or self.clock()),
+            )
         self.state.consecutive_failures = 0
         self.state.offline_since = None
         self.state.last_error = ""
@@ -125,7 +153,9 @@ class DevicePoller:
         # Record that the plug did not answer. Metrics stay empty: missing readings are never invented.
         self.storage.save(offline_measurement(self.collector_id, settings.id, datetime.fromtimestamp(now, UTC)))
         level = logging.ERROR if kind in ("auth", "unsupported") else logging.WARNING
-        if self.state.consecutive_failures == 1 or kind in ("auth", "unsupported"):
+        if self.state.consecutive_failures == 1:
+            log.log(level, "Device %s (%s): connection lost (%s): %s", settings.id, settings.name, kind, message)
+        elif kind in ("auth", "unsupported"):
             log.log(level, "Device %s (%s): %s", settings.id, settings.name, message)
         else:
             log.debug("Device %s: still failing (%d): %s", settings.id, self.state.consecutive_failures, message)
@@ -158,18 +188,51 @@ class Collector:
         plugs: list[Plug] | None = None,
         client: ApiClient | None = None,
         clock: Callable[[], float] = time.time,
+        rediscovery: Rediscovery | None = None,
     ) -> None:
         self.settings = settings
         self.clock = clock
         self.storage = storage or Storage(settings.storage.database_path, max_pending=settings.storage.max_pending_measurements)
+        self._prepare_identities()
+        self.rediscovery = rediscovery or Rediscovery(settings.rediscovery)
         if plugs is None:
             credentials = kasa_credentials(secrets.tapo_username, secrets.tapo_password)
-            plugs = [TapoPlug(d, credentials, self.storage, timeout=settings.device_timeout_seconds) for d in settings.devices]
+            plugs = [TapoPlug(d, credentials, self.storage, timeout=settings.device_timeout_seconds, locator=self.rediscovery) for d in settings.devices]
         self.pollers = [DevicePoller(p, self.storage, settings.collector_id, clock=clock) for p in plugs]
+        self.rediscovery.online_plugs = self._online_plugs
+        self.rediscovery.known_macs = self._known_macs
         self.client = client or ApiClient(settings.upload, secrets.api_token)
         self.uploader = UploadManager(self.storage, self.client, settings.upload, settings.collector_id, clock=clock)
         self.started_at = clock()
         self._last_upload_alert: float | None = None
+
+    def _prepare_identities(self) -> None:
+        """Pin MACs from the configuration and forget identities of removed plugs, so that no plug can learn a MAC
+        that belongs to another configured plug."""
+        try:
+            self.storage.forget_identities_except(d.id for d in self.settings.devices)
+            for device in self.settings.devices:
+                if device.mac:
+                    owner = self.storage.identity_owner(device.mac)
+                    if owner and owner != device.id:
+                        log.warning("MAC %s is configured for %s but was learned for %s; the configuration wins", device.mac, device.id, owner)
+                        self.storage.forget_identity(owner)
+                    self.storage.set_identity(device.id, device.mac, "config")
+        except Exception:
+            log.exception("Could not prepare device identities")
+
+    def _online_plugs(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for poller in self.pollers:
+            plug = poller.plug
+            if getattr(plug, "connected", False) and getattr(plug, "expected_mac", ""):
+                result[str(getattr(plug, "host", ""))] = str(getattr(plug, "expected_mac", ""))
+        return result
+
+    def _known_macs(self) -> set[str]:
+        return {str(getattr(p.plug, "expected_mac", "")) for p in self.pollers if getattr(p.plug, "expected_mac", "")} | {
+            d.mac for d in self.settings.devices if d.mac
+        }
 
     # ---------------------------------------------------------------- reporting
 
@@ -192,6 +255,7 @@ class Collector:
                 "last_status": up.last_status,
             },
             "devices": [p.state.as_dict() for p in self.pollers],
+            "rediscovery": self.rediscovery.status(),
         }
 
     def write_status(self) -> None:

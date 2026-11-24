@@ -227,6 +227,15 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     for d in settings.devices:
         extra = f", machine '{d.machine}'" if d.machine else ""
         print(f"    - {d.id:<20} {d.host:<16} every {d.polling_interval_seconds:g} s  ({d.name}{extra})")
+        print(f"      {'':<20} mac {d.mac or '(learned automatically on first connection)'}")
+    r = settings.rediscovery
+    if r.enabled:
+        print(f"  rediscovery       after {r.failures_before_rediscovery} failed connection(s), retry {r.min_interval_seconds:g}-{r.max_interval_seconds:g} s")
+        print(f"    broadcast       {', '.join(r.broadcast_targets) or 'off'}")
+        print(f"    unicast scan    {', '.join(r.scan_networks) or 'off'}")
+        print(f"    candidate hosts {', '.join(r.candidate_hosts) or 'none'}")
+    else:
+        print("  rediscovery       disabled (plugs are only looked for at their last known address)")
     print("  secrets           TAPO_USERNAME, TAPO_PASSWORD and ENERGY_API_TOKEN are set (values not shown)")
     return EXIT_OK
 
@@ -259,9 +268,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     upload = report.get("upload", {})
     if upload.get("failing_since"):
         problems.append(f"uploads failing since {upload['failing_since']}: {upload.get('last_error')}")
+    rediscovery = report.get("rediscovery") or {}
     for device in report.get("devices", []):
         if device.get("offline_since"):
             problems.append(f"device {device['device_id']} offline since {device['offline_since']}: {device.get('last_error')}")
+            conn = device.get("connection") or {}
+            if not conn.get("mac"):
+                problems.append(f"device {device['device_id']} cannot be searched for at another address: its MAC is unknown (add mac: to config.yaml)")
+    any_offline = any(d.get("offline_since") for d in report.get("devices", []))
+    if (
+        any_offline
+        and rediscovery.get("broadcast") in ("blocked", "no_response", "error")
+        and not (rediscovery.get("scan_networks") or rediscovery.get("candidate_hosts"))
+    ):
+        problems.append(
+            f"broadcast discovery {rediscovery['broadcast'].replace('_', ' ')} ({rediscovery.get('detail')}); a plug that changed address "
+            "cannot be found. Configure rediscovery.scan_networks or rediscovery.candidate_hosts (see README section 12)"
+        )
     if not args.json:
         q = report["queue"]
         print(f"Collector       {report.get('collector_id', settings.collector_id)}  (status updated {report.get('updated_at', 'never')})")
@@ -275,6 +298,26 @@ def cmd_status(args: argparse.Namespace) -> int:
             power = device.get("last_power_w")
             power_text = f"{power:.1f} W" if isinstance(power, (int, float)) else "-"
             print(f"  {state} {device['device_id']:<20} {device['host']:<16} {power_text:>10}  last ok {device.get('last_success') or '-'}")
+            conn = device.get("connection")
+            if conn:
+                print(f"           identity {conn.get('mac') or 'unknown'} ({conn.get('identity')}), configured host {conn.get('configured_host')}")
+                change = conn.get("last_host_change")
+                if change:
+                    print(f"           address changed {change.get('from')} -> {change.get('to')} at {change.get('at')}")
+                red = conn.get("rediscovery") or {}
+                if red.get("attempts") or red.get("state") not in (None, "idle"):
+                    nxt = red.get("next_attempt_in_seconds")
+                    when = f", next in {nxt} s" if nxt is not None else ""
+                    print(f"           rediscovery {red.get('state')}: {red.get('attempts')} attempt(s), last {red.get('last_attempt') or '-'}{when}")
+                    if red.get("last_result"):
+                        print(f"             {red['last_result']}")
+        if rediscovery:
+            alt = ", ".join([*rediscovery.get("scan_networks", []), *rediscovery.get("candidate_hosts", [])]) or "none configured"
+            detail = f" ({rediscovery['detail']})" if rediscovery.get("detail") else ""
+            print(f"Rediscovery     {'enabled' if rediscovery.get('enabled') else 'DISABLED'}, broadcast {rediscovery.get('broadcast')}{detail}")
+            print(f"                last scan {rediscovery.get('last_scan') or 'never'}, unicast alternatives: {alt}")
+            for unknown in rediscovery.get("unknown_devices", []):
+                print(f"                ignored unknown Tapo device {unknown['mac']} at {unknown['host']}")
         for item in report.get("recent_rejections", []):
             print(f"  rejected {item['measurement_id']} ({item['device_id']} {item['timestamp']}): {item['last_error']}")
         for problem in problems:

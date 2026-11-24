@@ -93,6 +93,21 @@ def test_connection_cache_round_trip(storage: Storage) -> None:
     config = {"host": "192.0.2.10", "connection_type": {"device_family": "SMART.TAPOPLUG", "encryption_type": "KLAP"}}
     storage.set_connection("printer_01", "192.0.2.10", config)
     assert storage.get_connection("printer_01", "192.0.2.10") == config
-    assert storage.get_connection("printer_01", "192.0.2.99") is None  # host changed in config: ignore cache
+    # Protocol parameters belong to the physical plug: reused after an IP change (identity is verified on connect).
+    assert storage.get_connection("printer_01", "192.0.2.99") == config
+    assert storage.get_last_host("printer_01") == "192.0.2.10"
     storage.forget_connection("printer_01")
     assert storage.get_connection("printer_01", "192.0.2.10") is None
+    assert storage.get_last_host("printer_01") is None
+
+
+def test_identities_round_trip_and_cleanup(storage: Storage) -> None:
+    assert storage.get_identity("hotplate_01") is None
+    storage.set_identity("hotplate_01", "AA:AA:AA:00:00:01", "learned")
+    storage.set_identity("removed_01", "AA:AA:AA:00:00:09", "learned")
+    assert storage.get_identity("hotplate_01") == ("AA:AA:AA:00:00:01", "learned")
+    assert storage.identity_owner("AA:AA:AA:00:00:01") == "hotplate_01"
+    assert storage.forget_identities_except(["hotplate_01"]) == 1
+    assert storage.identity_owner("AA:AA:AA:00:00:09") is None
+    storage.forget_identity("hotplate_01")
+    assert storage.get_identity("hotplate_01") is None

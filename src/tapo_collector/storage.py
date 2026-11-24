@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS device_connections (
     updated_at  REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Added in 1.1 (additive, so older collector versions still open the database).
+CREATE TABLE IF NOT EXISTS device_identities (
+    device_id   TEXT PRIMARY KEY,
+    mac         TEXT NOT NULL,                  -- verified after login: the plug's permanent identity
+    source      TEXT NOT NULL,                  -- 'config' or 'learned'
+    updated_at  REAL NOT NULL
+);
 """
 
 
@@ -261,9 +268,17 @@ class Storage:
     # ------------------------------------------------------------------ connection cache
 
     def get_connection(self, device_id: str, host: str) -> dict[str, Any] | None:
+        """Cached protocol parameters of this physical plug. They do not depend on its address, so they are reused
+        after an IP change (``host`` is accepted for interface compatibility; the caller supplies the address)."""
         with self._lock:
-            row = self._db.execute("SELECT config_json FROM device_connections WHERE device_id=? AND host=?", (device_id, host)).fetchone()
+            row = self._db.execute("SELECT config_json FROM device_connections WHERE device_id=?", (device_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def get_last_host(self, device_id: str) -> str | None:
+        """The address at which the plug was last connected *and* verified (survives restarts)."""
+        with self._lock:
+            row = self._db.execute("SELECT host FROM device_connections WHERE device_id=?", (device_id,)).fetchone()
+        return str(row[0]) if row else None
 
     def set_connection(self, device_id: str, host: str, config: dict[str, Any]) -> None:
         with self._transaction() as db:
@@ -277,3 +292,35 @@ class Storage:
     def forget_connection(self, device_id: str) -> None:
         with self._transaction() as db:
             db.execute("DELETE FROM device_connections WHERE device_id=?", (device_id,))
+
+    # ------------------------------------------------------------------ device identities
+
+    def get_identity(self, device_id: str) -> tuple[str, str] | None:
+        """(mac, source) of a plug, or None when it has never been verified."""
+        with self._lock:
+            row = self._db.execute("SELECT mac, source FROM device_identities WHERE device_id=?", (device_id,)).fetchone()
+        return (str(row[0]), str(row[1])) if row else None
+
+    def set_identity(self, device_id: str, mac: str, source: str) -> None:
+        with self._transaction() as db:
+            db.execute(
+                "INSERT INTO device_identities (device_id, mac, source, updated_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(device_id) DO UPDATE SET mac=excluded.mac, source=excluded.source, updated_at=excluded.updated_at",
+                (device_id, mac, source, time.time()),
+            )
+
+    def identity_owner(self, mac: str) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT device_id FROM device_identities WHERE mac=? ORDER BY updated_at DESC LIMIT 1", (mac,)).fetchone()
+        return str(row[0]) if row else None
+
+    def forget_identity(self, device_id: str) -> None:
+        with self._transaction() as db:
+            db.execute("DELETE FROM device_identities WHERE device_id=?", (device_id,))
+
+    def forget_identities_except(self, device_ids: Iterable[str]) -> int:
+        """Drop identities of plugs that were removed from the configuration (so their MAC can be reused)."""
+        keep = list(device_ids)
+        with self._transaction() as db:
+            placeholders = ",".join("?" * len(keep)) or "''"
+            return db.execute(f"DELETE FROM device_identities WHERE device_id NOT IN ({placeholders})", keep).rowcount  # noqa: S608

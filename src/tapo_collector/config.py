@@ -36,10 +36,28 @@ class ConfigError(ValueError):
 class DeviceSettings:
     id: str
     name: str
-    host: str
+    host: str  # initial / fallback address; the collector follows the plug when its DHCP address changes
     machine: str = ""
     category: str = ""
     polling_interval_seconds: float = 10.0
+    mac: str = ""  # permanent identity "AA:BB:CC:DD:EE:FF"; empty = learned from the plug on first verified connection
+
+
+@dataclass(frozen=True)
+class RediscoverySettings:
+    """How a plug whose address changed is found again. Every candidate is verified by MAC after login."""
+
+    enabled: bool = True
+    failures_before_rediscovery: int = 3
+    min_interval_seconds: float = 30.0
+    max_interval_seconds: float = 900.0
+    discovery_timeout_seconds: int = 5
+    broadcast_targets: tuple[str, ...] = ("255.255.255.255",)
+    # Network-approved alternatives for networks that block broadcast (e.g. UGentSurfing):
+    scan_networks: tuple[str, ...] = ()  # unicast UDP probe of every address in these ranges (max /22 each)
+    candidate_hosts: tuple[str, ...] = ()  # addresses/hostnames to try directly (TCP login + MAC check)
+    scan_concurrency: int = 32
+    result_cache_seconds: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -98,6 +116,7 @@ class Settings:
     logging: LoggingSettings
     alerts: AlertSettings
     config_path: Path
+    rediscovery: RediscoverySettings = field(default_factory=RediscoverySettings)
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -167,6 +186,69 @@ def validate_host(host: str, where: str) -> str:
     if address.version != 4:
         raise ConfigError(f"{where} must be an IPv4 address or hostname (Tapo plugs use IPv4).")
     return host
+
+
+def normalize_mac(value: Any) -> str:
+    """``a8-42-a1-01-02-03`` / ``A842A1010203`` -> ``A8:42:A1:01:02:03``; anything that is not a MAC -> ``""``."""
+    if not isinstance(value, str):
+        return ""
+    digits = re.sub(r"[^0-9A-Fa-f]", "", value)
+    if len(digits) != 12 or len(re.sub(r"[0-9A-Fa-f:.\- ]", "", value)) > 0:
+        return ""
+    return ":".join(digits[i : i + 2] for i in range(0, 12, 2)).upper()
+
+
+def _string_list(section: dict[str, Any], key: str, default: tuple[str, ...], where: str) -> tuple[str, ...]:
+    value = section.get(key, list(default))
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ConfigError(f"{where}.{key} must be a list of text values.")
+    return tuple(v.strip() for v in value)
+
+
+MAX_SCAN_ADDRESSES = 1024
+
+
+def _rediscovery(raw: dict[str, Any]) -> RediscoverySettings:
+    where = "rediscovery"
+    section = _section(raw, where)
+    enabled = section.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("rediscovery.enabled must be true or false.")
+    targets = _string_list(section, "broadcast_targets", ("255.255.255.255",), where)
+    for target in targets:
+        try:
+            if ipaddress.ip_address(target).version != 4:
+                raise ValueError
+        except ValueError:
+            raise ConfigError(f"rediscovery.broadcast_targets: '{target}' is not an IPv4 address (e.g. 192.168.1.255).") from None
+    networks = _string_list(section, "scan_networks", (), where)
+    for cidr in networks:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            raise ConfigError(f"rediscovery.scan_networks: '{cidr}' is not a network such as 192.168.1.0/24.") from None
+        if network.version != 4 or network.num_addresses > MAX_SCAN_ADDRESSES:
+            raise ConfigError(f"rediscovery.scan_networks: '{cidr}' must be an IPv4 range of at most {MAX_SCAN_ADDRESSES} addresses (/22).")
+    candidates = tuple(validate_host(h, "rediscovery.candidate_hosts entry") for h in _string_list(section, "candidate_hosts", (), where))
+    settings = RediscoverySettings(
+        enabled=enabled,
+        failures_before_rediscovery=_integer(section, "failures_before_rediscovery", 3, minimum=1, maximum=100, where=where),
+        min_interval_seconds=_number(section, "min_interval_seconds", 30, minimum=0, maximum=86400, where=where),
+        max_interval_seconds=_number(section, "max_interval_seconds", 900, minimum=1, maximum=86400, where=where),
+        discovery_timeout_seconds=_integer(section, "discovery_timeout_seconds", 5, minimum=1, maximum=60, where=where),
+        broadcast_targets=targets,
+        scan_networks=networks,
+        candidate_hosts=candidates,
+        scan_concurrency=_integer(section, "scan_concurrency", 32, minimum=1, maximum=256, where=where),
+        result_cache_seconds=_number(section, "result_cache_seconds", 15, minimum=0, maximum=3600, where=where),
+    )
+    if settings.min_interval_seconds > settings.max_interval_seconds:
+        raise ConfigError("rediscovery.min_interval_seconds must not exceed rediscovery.max_interval_seconds.")
+    return settings
 
 
 def validate_endpoint(url: str) -> str:
@@ -276,6 +358,7 @@ def settings_from_dict(raw: dict[str, Any], config_path: Path) -> Settings:
     devices: list[DeviceSettings] = []
     seen_ids: set[str] = set()
     seen_hosts: dict[str, str] = {}
+    seen_macs: dict[str, str] = {}
     for index, item in enumerate(devices_raw):
         where = f"devices[{index}]"
         if not isinstance(item, dict):
@@ -291,6 +374,14 @@ def settings_from_dict(raw: dict[str, Any], config_path: Path) -> Settings:
             raise ConfigError(f"{where}.host {host} is already used by device '{seen_hosts[host]}'.")
         seen_hosts[host] = device_id
         name = _text(item, "name", device_id, where=where) or device_id
+        mac_text = _text(item, "mac", where=where, max_length=32)
+        mac = normalize_mac(mac_text)
+        if mac_text and not mac:
+            raise ConfigError(f"{where}.mac '{mac_text}' is not a MAC address such as A8:42:A1:01:02:03 (see the Tapo app: Device info).")
+        if mac and mac in seen_macs:
+            raise ConfigError(f"{where}.mac {mac} is already used by device '{seen_macs[mac]}'.")
+        if mac:
+            seen_macs[mac] = device_id
         devices.append(
             DeviceSettings(
                 id=device_id,
@@ -299,6 +390,7 @@ def settings_from_dict(raw: dict[str, Any], config_path: Path) -> Settings:
                 machine=_text(item, "machine", where=where),
                 category=_text(item, "category", where=where),
                 polling_interval_seconds=_number(item, "polling_interval_seconds", interval, minimum=2, maximum=3600, where=where),
+                mac=mac,
             )
         )
 
@@ -355,4 +447,5 @@ def settings_from_dict(raw: dict[str, Any], config_path: Path) -> Settings:
         logging=logging_settings,
         alerts=alerts,
         config_path=config_path,
+        rediscovery=_rediscovery(raw),
     )

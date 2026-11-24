@@ -36,7 +36,28 @@ voltage (~230 V) and current are also shown.
    * [ ] `sudo tapo-collector status` shows the plug as `OFFLINE`, and the other plugs keep updating.
    * [ ] The website shows **Offline** for it within a minute. After 5 minutes the log shows `ALERT device …` (`journalctl -u tapo-collector`).
 2. Plug it back in.
-   * [ ] Within about 1–5 minutes it is **Online** again and the log says `reachable again`.
+   * [ ] Within about 1–5 minutes it is **Online** again and the log says `reconnected at <ip>`.
+
+## 3b. Plug comes back at a different IP address (automatic rediscovery)
+
+This is the acceptance test for automatic recovery. Do it once on the workshop network after installing 1.1.
+
+1. Run `sudo tapo-collector status`. Note the plug's address and check that it shows `identity AA:BB:… (config)` or
+   `(learned)`. If it says `identity unknown`, let the collector read the plug once first.
+2. Force a new address: pull the plug, then either remove its DHCP reservation / lease in the router, or move it to a
+   different access point or VLAN segment that still reaches the workshop computer. Plug it back in. Check its new IP
+   in the Tapo app (Device info).
+3. Do **not** touch `config.yaml` and do **not** restart the service. Watch `journalctl -u tapo-collector -f`.
+   * [ ] Within about 2–5 minutes the log shows `rediscovery started`, `identity verified (MAC … at <new ip>)`,
+     `IP address changed from <old> to <new>` and `reconnected`.
+   * [ ] `sudo tapo-collector status` shows the new address and `address changed <old> -> <new>`.
+   * [ ] The website shows the plug **Online** again; the graph has offline markers but no invented values.
+   * [ ] `sudo systemctl restart tapo-collector`: after the restart it connects straight to the new address
+     (no `rediscovery started` in the log).
+4. If the log instead says `broadcast discovery blocked` or `no response`, broadcast is filtered on this network.
+   Ask the network administrator whether a unicast scan of the plugs' subnet is allowed and set
+   `rediscovery.scan_networks`, or list the plugs' possible addresses/hostnames in `rediscovery.candidate_hosts`
+   (README section 12), restart once, and repeat this test.
 
 ## 4. Internet outage (offline buffering)
 
