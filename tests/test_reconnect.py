@@ -341,7 +341,7 @@ async def test_blocked_broadcast_is_detected_and_reported(net: Network, storage:
     assert "rediscovery did not find the plug" in str(errors[-1])
     status = locator.status()
     assert status["broadcast"] == "blocked" and "192.0.2.11" in status["detail"]
-    assert "UGentSurfing" in caplog.text and "scan_networks" in caplog.text
+    assert "UGentSurfing" in caplog.text and "scan_networks" in caplog.text and "broadcast_targets" in caplog.text
     assert "not found" in hot.connection_status()["rediscovery"]["last_result"]
     assert (await solder.read()).metrics["power_w"] == 25  # the other plug is unaffected
 
@@ -437,6 +437,56 @@ async def test_plug_without_known_identity_does_not_rediscover(net: Network, sto
     await failing_reads(plug, 2)
     assert net.probes == [] and plug.rediscovery_state == "unavailable"
     assert caplog.text.count("MAC address is unknown") == 1
+
+
+async def test_plug_offline_for_an_extended_period(net: Network, storage: Storage) -> None:
+    clock = Clock()
+    net.devices["192.0.2.10"] = PhysicalPlug(MAC_HOT, 100)
+    locator = make_locator(net, clock)  # rediscovery backoff 30 s, 60 s, then capped at 120 s
+    plug = make_plug(HOT, storage, locator, clock)
+    await plug.read()
+    gone = net.devices.pop("192.0.2.10")
+    for _ in range(360):  # one failed poll every 10 s for an hour
+        with pytest.raises(DeviceReadError):
+            await plug.read()
+        clock.now += 10
+    # Bounded effort: ~30 s + 60 s, then one search every 120 s - not one per poll.
+    assert 25 <= locator.scans <= 35
+    assert plug.next_rediscovery_at - clock.now <= 120
+    assert plug.connection_status()["rediscovery"]["consecutive_failures"] == locator.scans
+    net.devices["192.0.2.99"] = gone  # back after an hour, at another address
+    clock.now += 120
+    assert (await plug.read()).metrics["power_w"] == 100
+    assert plug.host == "192.0.2.99" and plug.rediscovery_failures == 0 and plug.rediscovery_state == "idle"
+
+
+async def test_wrong_credentials_do_not_trigger_rediscovery(net: Network, storage: Storage) -> None:
+    clock = Clock()
+    net.devices["192.0.2.10"] = PhysicalPlug(MAC_HOT, 100, account_ok=False)
+    locator = make_locator(net, clock, failures_before_rediscovery=1)
+    plug = make_plug(DeviceSettings(id="hotplate_01", name="Hotplate", host="192.0.2.10", mac=MAC_HOT), storage, locator, clock)
+    for _ in range(3):
+        with pytest.raises(DeviceReadError) as info:
+            await plug.read()
+        assert info.value.kind == "auth" and "TAPO_USERNAME" in str(info.value)
+        assert "tapo-password-123" not in str(info.value)
+    assert net.probes == []  # a credentials problem is not an address problem
+
+
+async def test_rediscovered_plug_rejecting_the_login_is_reported_as_auth(net: Network, storage: Storage) -> None:
+    clock = Clock()
+    net.devices["192.0.2.10"] = PhysicalPlug(MAC_HOT, 100)
+    locator = make_locator(net, clock, failures_before_rediscovery=1)
+    plug = make_plug(HOT, storage, locator, clock)
+    await plug.read()
+    moved = net.devices.pop("192.0.2.10")
+    moved.account_ok = False  # e.g. the plug was reset and added to another Tapo account
+    net.devices["192.0.2.57"] = moved
+    await failing_reads(plug, 1)
+    with pytest.raises(DeviceReadError) as info:
+        await plug.read()
+    assert info.value.kind == "auth"
+    assert plug.host == "192.0.2.10" and storage.get_last_host("hotplate_01") == "192.0.2.10"  # not adopted
 
 
 # ---------------------------------------------------------------- probe and configuration

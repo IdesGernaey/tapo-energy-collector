@@ -20,7 +20,7 @@ from typing import Any, Protocol
 from tapo_collector import __version__
 from tapo_collector.config import DeviceSettings, Secrets, Settings
 from tapo_collector.devices import DeviceReadError, Reading, TapoPlug, kasa_credentials
-from tapo_collector.measurements import format_timestamp, offline_measurement, online_measurement
+from tapo_collector.measurements import Measurement, format_timestamp, offline_measurement, online_measurement
 from tapo_collector.rediscovery import Rediscovery
 from tapo_collector.storage import Storage
 from tapo_collector.uploader import ApiClient, Outcome, UploadManager
@@ -122,7 +122,7 @@ class DevicePoller:
             log.exception("Device %s: unexpected error while reading", settings.id)
             return self._failure(f"unexpected error: {error}", "error")
         measurement = online_measurement(self.collector_id, settings.id, reading.timestamp, reading.metrics)
-        self.storage.save(measurement)
+        self._save(measurement)
         if self.state.consecutive_failures:
             log.info(
                 "Device %s (%s) reconnected at %s after %d failed poll(s); offline for %.0f s",
@@ -142,6 +142,10 @@ class DevicePoller:
         log.debug("Device %s: %.1f W (%.2f s)", settings.id, measurement.power_w or 0.0, reading.latency_seconds)
         return True
 
+    def _save(self, measurement: Measurement) -> None:
+        if not self.storage.save(measurement):  # IDs are random UUIDs, so this indicates a bug: make it visible
+            log.error("Device %s: reading %s was not stored (measurement ID already exists)", measurement.device_id, measurement.measurement_id)
+
     def _failure(self, message: str, kind: str) -> bool:
         settings = self.plug.settings
         now = self.clock()
@@ -151,7 +155,7 @@ class DevicePoller:
         if self.state.offline_since is None:
             self.state.offline_since = now
         # Record that the plug did not answer. Metrics stay empty: missing readings are never invented.
-        self.storage.save(offline_measurement(self.collector_id, settings.id, datetime.fromtimestamp(now, UTC)))
+        self._save(offline_measurement(self.collector_id, settings.id, datetime.fromtimestamp(now, UTC)))
         level = logging.ERROR if kind in ("auth", "unsupported") else logging.WARNING
         if self.state.consecutive_failures == 1:
             log.log(level, "Device %s (%s): connection lost (%s): %s", settings.id, settings.name, kind, message)
