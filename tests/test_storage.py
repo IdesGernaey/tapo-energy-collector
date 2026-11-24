@@ -31,8 +31,9 @@ def test_saved_readings_survive_restart(tmp_path: Path) -> None:
 
 
 def test_duplicate_ids_are_ignored(storage: Storage) -> None:
-    assert storage.save(reading(1)) is True
-    assert storage.save(reading(1)) is False
+    measurement = reading(1)
+    assert storage.save(measurement) is True
+    assert storage.save(measurement) is False  # the same reading (same ID) is never stored twice
     assert storage.stats().pending == 1
 
 

@@ -69,7 +69,9 @@ rediscovery:
   min_interval_seconds: 30            # wait after a failed search; doubles each time ...
   max_interval_seconds: 900           # ... up to this maximum
   discovery_timeout_seconds: 5
-  broadcast_targets: ["255.255.255.255"]   # or your subnet's broadcast address, e.g. "192.168.1.255"
+  # Add the Wi-Fi subnet's own broadcast address too (see "ip -4 addr", e.g. "192.168.7.255" for
+  # 192.168.0.0/21): on a computer with several network adapters 255.255.255.255 can leave via the wrong one.
+  broadcast_targets: ["255.255.255.255"]
   # Managed networks (e.g. UGentSurfing) often block broadcast. 'sudo tapo-collector status' then reports
   # "broadcast blocked" or "no_response". Use one of these network-approved alternatives (ask the network admin):
   scan_networks: []                   # e.g. ["10.10.4.0/24"]: unicast discovery probe of every address (max /22)

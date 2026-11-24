@@ -292,6 +292,7 @@ Status meanings on the website:
 | Plug was fine, now always offline | Usually an IP change, which is handled automatically (see below). `sudo tapo-collector status` shows the rediscovery state. If it says `identity unknown`, add `mac:`. If it says `broadcast blocked`/`no_response`, configure an alternative (below). After a firmware update the cached connection is renewed automatically. |
 | Log: `… is plug 'x' (MAC …), not y` | Another plug (or someone else's) now has this plug's old address. It is **not** read under the wrong ID; rediscovery looks for the right plug. Nothing to do unless it persists. |
 | Log: `ignoring unknown Tapo device` | A Tapo device that is not in `devices:` answered discovery. It is never used. |
+| Log (from `kasa`): `Query failed after successful authentication … Response status is 403` | Another program is polling the same plug at the same time (a second collector, a hand-started `tapo-collector run` next to the service, a test laptop, Home Assistant). Each login replaces the other's session, so both keep logging in again. Readings still arrive, but only one program should poll continuously. A short `test-device` is fine. |
 | `test-upload`: `HTTP 401` | The token is wrong or revoked. Create a new one ([section 13](#13-rotate-passwords-and-tokens)). |
 | `HTTP 404` / `endpoint_url` error | Wrong URL, or the website version without energy monitoring is still deployed. |
 | `network error` / `timed out` | No internet, DNS problem, or a proxy/firewall blocks outbound HTTPS. Readings are kept; check `curl -I https://<website>/api/health`. |
@@ -319,8 +320,11 @@ connection and stored in the database). When a plug stops answering:
 Log lines to look for: `connection lost`, `rediscovery started`, `identity verified`, `IP address changed from … to …`,
 `reconnected`, `rediscovery failed`.
 
-**When broadcast discovery is blocked** (common on UGentSurfing and other managed networks), `sudo tapo-collector
-status` shows `broadcast blocked` (a connected plug did not answer the broadcast) or `broadcast no_response`. Then a
+**When broadcast discovery gets no answer**, `sudo tapo-collector status` shows `broadcast blocked` (a connected
+plug did not answer the broadcast) or `broadcast no_response`. First rule out the computer itself: with several
+network adapters (Docker, VPN, WSL) `255.255.255.255` can leave via the wrong one. Add the Wi-Fi subnet's own
+broadcast address to `rediscovery.broadcast_targets` (from `ip -4 addr`: `192.168.0.0/21` → `192.168.7.255`). If that
+does not help either, the network drops broadcast (common on UGentSurfing and other managed networks). Then a
 plug that changed address cannot be found by broadcast. Ask the network administrator which of these is allowed, set
 it under `rediscovery:` in `config.yaml`, then run `sudo systemctl restart tapo-collector`:
 
@@ -391,21 +395,60 @@ to the SQLite database, so going back to 1.0 still works.
    sudo sh deployment/linux/update.sh
    ```
 
-3. **Pin the identities** (recommended). After the update each plug's MAC is learned on its first connection:
+3. **Pin the identities and set the broadcast address.** Edit `/etc/tapo-collector/config.yaml`: add `mac:` to each
+   plug (keep the other fields) and add the `rediscovery:` section. Workshop values, verified on 2026-11-25 by reading
+   each plug's MAC over its authenticated connection:
 
-   ```sh
-   journalctl -u tapo-collector --since "10 min ago" | grep "identity learned"
+   ```yaml
+   devices:
+     - id: hotplate_01
+       name: "Hotplate"
+       host: "192.168.1.44"
+       mac: "BC:07:1D:A2:D0:F1"      # Tapo app name "Hotplate"
+       # (keep machine:, category:, ... as they are)
+     - id: soldering_01
+       name: "Soldering Station"
+       host: "192.168.1.42"
+       mac: "BC:07:1D:A2:D8:59"      # Tapo app name "Soldering Station"
+
+   rediscovery:
+     enabled: true
+     failures_before_rediscovery: 3
+     min_interval_seconds: 30
+     max_interval_seconds: 900
+     broadcast_targets: ["255.255.255.255", "192.168.7.255"]
+     scan_networks: []
+     candidate_hosts: []
    ```
 
-   Compare each MAC with the Tapo app (Device info) and add it to that plug in `/etc/tapo-collector/config.yaml`
-   as `mac: "AA:BB:CC:DD:EE:FF"`. Then run `sudo tapo-collector check-config && sudo systemctl restart tapo-collector`.
-4. **Check broadcast**: after the first search, `sudo tapo-collector status` shows `Rediscovery … broadcast …`
+   `192.168.7.255` is the broadcast address of `192.168.0.0/21`, the network the plugs were found on. Check it on the
+   workshop PC with `ip -4 addr` (look for `192.168.x.y/21`); for another prefix use that subnet's broadcast address.
+   Then run `sudo tapo-collector check-config`.
+4. **Confirm the physical mapping.** The MACs above match the names in the Tapo app, but the names are only labels.
+   Switch the hotplate on, then run `sudo tapo-collector test-device --device hotplate_01`. It must show the
+   hotplate's power; a wrong `mac:` makes it fail with `identity`. Repeat with the soldering station. Then
+   `sudo systemctl restart tapo-collector`.
+5. **Check broadcast**: after the first search, `sudo tapo-collector status` shows `Rediscovery … broadcast …`
    (`not_tried` until a plug has needed one; the acceptance test below triggers one). If it reports `blocked` or
-   `no_response`, configure `scan_networks` or `candidate_hosts` ([section 12](#plug-changed-ip-address-automatic-rediscovery)).
-5. **Accept**: run [docs/MANUAL_TEST.md](docs/MANUAL_TEST.md) section 3b (plug comes back with a different address).
+   `no_response`, first check the broadcast address and the PC's network adapters (`ip -4 addr`), then consider
+   `scan_networks` or `candidate_hosts` ([section 12](#plug-changed-ip-address-automatic-rediscovery)).
+6. **Accept**: run [docs/MANUAL_TEST.md](docs/MANUAL_TEST.md) section 3b (plug comes back with a different address).
 
 Rollback: check out the previous commit in `~/tapo-energy-collector` and run `sudo sh deployment/linux/install.sh`.
 Version 1.0 ignores the new `mac:` and `rediscovery:` settings and the new database table, so nothing else is needed.
+
+**Known limitations of 1.1**
+
+* A plug that has never been connected and has no `mac:` cannot be searched for. Pin the MACs (step 3).
+* Without `mac:`, the MAC is learned on the first connection. If the plugs had already swapped addresses before
+  that, they would learn each other's MAC. Pinning the MACs prevents this.
+* `no_response` cannot tell "broadcast blocked" from "sent out of the wrong adapter" or "no plug powered"; only
+  `blocked` (a connected plug did not answer) is real evidence. On a Windows test laptop with a WSL adapter,
+  255.255.255.255 got no reply while the subnet's own broadcast address worked.
+* A search runs inside that plug's own poll and can delay only that plug (discovery timeout plus up to 4× the device
+  timeout per candidate). The other plugs keep polling.
+* `scan_networks` sends a discovery packet to every address of the range: use it only with the network administrator's approval.
+* Plugs on the newer TPAP firmware are still not supported by python-kasa 0.12, rediscovery or not.
 
 **Updating dependencies** (developers): change the ranges in `pyproject.toml`, then regenerate the lock file in a clean
 environment (`python -m venv /tmp/lock && /tmp/lock/bin/pip install . && /tmp/lock/bin/pip freeze --exclude tapo-energy-collector`).
@@ -420,7 +463,7 @@ src/tapo_collector/
   main.py            CLI: run, discover, test-device, test-upload, check-config, status, retry-now, requeue-rejected
   config.py          YAML + environment loading and validation (secrets only from the environment)
   devices.py         python-kasa connection: cached params → discover_single (UDP) → try_connect_all (TCP); read-only
-  measurements.py    Measurement model, units, plausibility checks, UTC timestamps, stable UUIDv5 IDs
+  measurements.py    Measurement model, units, plausibility checks, UTC timestamps, unique UUIDv4 IDs
   storage.py         SQLite queue (WAL, synchronous=FULL): pending → delivered | rejected, per-record deferral
   uploader.py        HTTP client + status-code handling, exponential backoff with jitter, batch splitting
   service.py         one polling task per plug, upload loop, alerts, status.json, graceful shutdown
@@ -438,7 +481,8 @@ Key decisions:
   reported over the authenticated connection; discovery replies (unauthenticated) are only used as hints. The last
   verified address and the identity are stored in SQLite (`device_connections`, `device_identities`).
 
-* **Readings are saved before upload.** IDs are deterministic (UUIDv5 of collector + device + timestamp), so a retry
+* **Readings are saved before upload.** Each reading gets a random UUID when it is taken; it is stored with the
+  reading and reused unchanged for every retry (readings queued by 1.0 keep their older UUIDv5 IDs), so a retry
   after a lost response is acknowledged as a duplicate and never stored twice.
 * **Energy totals come from the plug's counters**, not from adding up power samples. The month counter is preferred
   because it does not reset at midnight. A decrease is a reset. The website computes this in

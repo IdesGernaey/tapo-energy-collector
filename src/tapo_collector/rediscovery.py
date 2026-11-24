@@ -104,9 +104,11 @@ class ScanResult:
 
 
 BLOCKED_HINT = (
-    "Broadcast discovery does not work on this network (managed networks such as UGentSurfing usually drop it). "
-    "Automatic recovery after an IP change then needs rediscovery.scan_networks or rediscovery.candidate_hosts in "
-    "config.yaml - ask the network administrator which is allowed - or a DHCP reservation for each plug."
+    "Two common causes: (1) the computer sent the broadcast out of the wrong network interface (several adapters, "
+    "e.g. Docker, VPN or WSL) - add the Wi-Fi subnet's own broadcast address to rediscovery.broadcast_targets "
+    "(e.g. 192.168.7.255 for 192.168.0.0/21; see 'ip -4 addr'); (2) the network drops broadcast (managed networks "
+    "such as UGentSurfing) - then use rediscovery.scan_networks or rediscovery.candidate_hosts (ask the network "
+    "administrator which is allowed) or a DHCP reservation for each plug."
 )
 
 

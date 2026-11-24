@@ -34,7 +34,7 @@ Content-Type: application/json
 |---|---|---|
 | `collector_id` | string, optional | Informational. The server identifies the collector by its token. |
 | `measurements` | array | 0–500 items. An empty array only checks the token (`tapo-collector test-upload`). |
-| `measurement_id` | string | 8–100 characters `[A-Za-z0-9_-]`. The collector uses a UUIDv5 of collector, device and timestamp, so it stays the same on every retry. |
+| `measurement_id` | string | 8–100 characters `[A-Za-z0-9_-]`. The collector generates a random UUID (v4) when the reading is taken and stores it with the reading, so it stays the same on every retry. Readings queued by collector 1.0 carry UUIDv5 IDs; both are accepted. |
 | `device_id` | string | `[a-z0-9][a-z0-9_-]{0,63}`. Must be registered **and enabled** on the website. |
 | `timestamp` | string | ISO 8601 with a time zone (`Z` or `±hh:mm`). Not more than 5 minutes in the future and not older than 400 days. |
 | `online` | boolean, optional (default `true`) | `false` = the plug did not answer that poll; then all metrics must be `null`. |

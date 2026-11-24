@@ -29,7 +29,8 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Namespace for deterministic measurement IDs (uuid5). Never change it: IDs must stay stable.
+# Version 1.0 derived IDs from uuid5(MEASUREMENT_NAMESPACE, "collector|device|timestamp"). Readings stored by 1.0
+# keep those IDs; new readings get random UUIDv4 IDs (see new_measurement_id). Kept for reference only.
 MEASUREMENT_NAMESPACE = uuid.UUID("6f0c8f53-1f5e-4f4a-9a43-2f3b7f0d5a11")
 
 # Plausibility limits. The P110 is rated 16 A / 3680 W at 230 V; the margins allow for measurement
@@ -84,9 +85,16 @@ def parse_timestamp(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def measurement_id(collector_id: str, device_id: str, timestamp: datetime) -> str:
-    """Stable, unique ID derived from collector, device and the exact (millisecond) timestamp."""
-    return str(uuid.uuid5(MEASUREMENT_NAMESPACE, f"{collector_id}|{device_id}|{format_timestamp(timestamp)}"))
+def new_measurement_id() -> str:
+    """A new, globally unique ID for one reading (random UUIDv4).
+
+    It is generated once, committed to SQLite together with the reading, and reused unchanged for every upload
+    retry, so the website still recognises a repeated upload as a duplicate. It is deliberately *not* derived from
+    the timestamp: two distinct readings with the same millisecond (system clock stepped back, a second collector
+    process with the same collector_id) must never share an ID, or one of them would be silently dropped.
+    Readings stored by version 1.0 keep their original (UUIDv5) IDs.
+    """
+    return str(uuid.uuid4())
 
 
 def clean_metric(name: str, value: Any, *, device_id: str = "?") -> float | None:
@@ -127,7 +135,7 @@ def metrics_from_energy_module(module: Any, device_id: str) -> dict[str, float |
 
 def online_measurement(collector_id: str, device_id: str, timestamp: datetime, metrics: dict[str, float | None]) -> Measurement:
     return Measurement(
-        measurement_id=measurement_id(collector_id, device_id, timestamp),
+        measurement_id=new_measurement_id(),
         device_id=device_id,
         timestamp=timestamp,
         online=True,
@@ -138,7 +146,7 @@ def online_measurement(collector_id: str, device_id: str, timestamp: datetime, m
 def offline_measurement(collector_id: str, device_id: str, timestamp: datetime) -> Measurement:
     """Records that a poll failed. All metrics are None: nothing is invented for missing readings."""
     return Measurement(
-        measurement_id=measurement_id(collector_id, device_id, timestamp),
+        measurement_id=new_measurement_id(),
         device_id=device_id,
         timestamp=timestamp,
         online=False,

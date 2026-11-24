@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+import re
+import uuid
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -10,8 +12,8 @@ from tapo_collector.measurements import (
     Measurement,
     clean_metric,
     format_timestamp,
-    measurement_id,
     metrics_from_energy_module,
+    new_measurement_id,
     offline_measurement,
     online_measurement,
     parse_timestamp,
@@ -126,12 +128,14 @@ def test_naive_timestamps_are_refused() -> None:
         offline_measurement("c", "d", datetime(2026, 11, 3, 12, 0))
 
 
-def test_measurement_ids_are_stable_and_unique() -> None:
-    ts = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
-    assert measurement_id("c", "d", ts) == measurement_id("c", "d", ts)
-    assert measurement_id("c", "d", ts) == measurement_id("c", "d", ts.astimezone(timezone(timedelta(hours=1))))
-    others = {measurement_id("c", "d", ts + timedelta(milliseconds=1)), measurement_id("c", "e", ts), measurement_id("x", "d", ts)}
-    assert measurement_id("c", "d", ts) not in others and len(others) == 3
+def test_measurement_ids_are_unique_even_within_the_same_millisecond() -> None:
+    ts = datetime(2026, 11, 3, 12, 0, 0, 123000, tzinfo=UTC)
+    readings = [online_measurement("c", "d", ts, {"power_w": 1.0}) for _ in range(50)] + [offline_measurement("c", "d", ts) for _ in range(50)]
+    ids = [m.measurement_id for m in readings]
+    assert len(set(ids)) == 100
+    api_pattern = re.compile(r"^[A-Za-z0-9_-]{8,100}$")  # docs/API.md
+    assert all(api_pattern.match(i) and uuid.UUID(i).version == 4 for i in ids)
+    assert new_measurement_id() != new_measurement_id()
 
 
 def test_offline_measurement_has_no_values_and_cannot_carry_any() -> None:

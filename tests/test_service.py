@@ -129,3 +129,68 @@ async def test_status_file_and_alerts(make_settings, secrets, caplog) -> None:
     assert status["queue"]["pending"] == 1
     assert TOKEN not in settings.status_path.read_text(encoding="utf-8")
     await collector.close()
+
+
+class LossyWebsite(FakeWebsite):
+    """Stores the batch but the response is lost on the first request (e.g. Wi-Fi drops mid-request)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_next_response = True
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        response = super().__call__(request)
+        if self.lose_next_response:
+            self.lose_next_response = False
+            raise httpx.ReadTimeout("response lost")
+        return response
+
+
+@respx.mock
+async def test_readings_in_the_same_millisecond_are_stored_and_delivered_independently(make_settings, secrets) -> None:
+    from tapo_collector.measurements import offline_measurement, online_measurement
+
+    settings = make_settings(upload={"min_retry_seconds": 0.1, "max_retry_seconds": 1})
+    website = LossyWebsite()
+    respx.post(ENDPOINT).mock(side_effect=website)
+    storage = Storage(settings.storage.database_path)
+    ts = datetime(2026, 11, 25, 10, 0, 0, 123000, tzinfo=UTC)
+    readings = [
+        online_measurement("test-collector", "printer_01", ts, {"power_w": 10.0}),
+        online_measurement("test-collector", "printer_01", ts, {"power_w": 20.0}),  # same device, same millisecond
+        offline_measurement("test-collector", "printer_01", ts),
+    ]
+    assert all(storage.save(m) for m in readings)  # none dropped locally
+    assert storage.stats().pending == 3
+    pending_ids = sorted(m.measurement_id for m in storage.next_batch(10))
+    collector = Collector(settings, secrets, storage=storage, plugs=[], client=ApiClient(settings.upload, TOKEN))
+
+    from tapo_collector.uploader import Outcome
+
+    assert await collector.uploader.upload_once() is Outcome.RETRY  # server stored them, but the reply was lost
+    assert sorted(m.measurement_id for m in storage.next_batch(10)) == pending_ids  # retry reuses the stored IDs
+    collector.uploader.paused_until = 0  # the retry backoff has elapsed
+    assert await collector.uploader.upload_once() is Outcome.SENT  # acknowledged as duplicates
+    assert storage.stats().pending == 0 and storage.stats().delivered == 3
+    assert sorted(website.stored) == pending_ids  # three distinct readings, each stored exactly once
+    assert sorted(m["power_w"] for m in website.stored.values() if m["online"]) == [10.0, 20.0]
+    await collector.close()
+
+
+@respx.mock
+async def test_readings_stored_by_version_1_0_keep_their_ids(make_settings, secrets) -> None:
+    import uuid
+
+    from tapo_collector.measurements import MEASUREMENT_NAMESPACE, Measurement
+
+    settings = make_settings()
+    website = FakeWebsite()
+    respx.post(ENDPOINT).mock(side_effect=website)
+    storage = Storage(settings.storage.database_path)
+    ts = datetime(2026, 11, 20, 8, 0, tzinfo=UTC)
+    legacy_id = str(uuid.uuid5(MEASUREMENT_NAMESPACE, "test-collector|printer_01|2026-11-20T08:00:00.000Z"))
+    storage.save(Measurement(legacy_id, "printer_01", ts, True, power_w=5.0))  # queued before the upgrade
+    collector = Collector(settings, secrets, storage=storage, plugs=[], client=ApiClient(settings.upload, TOKEN))
+    await collector.uploader.upload_once()
+    assert list(website.stored) == [legacy_id]
+    await collector.close()
